@@ -1,0 +1,267 @@
+---
+###############################################################################
+# Playbook  : oracle19c_patch_collection.yml
+# Approche  : COLLECTION — opitzconsulting.ansible_oracle
+# Cible     : Oracle 19c Single Instance (Linux)
+#
+# Prérequis :
+#   ansible-galaxy collection install opitzconsulting.ansible_oracle
+#
+# Variables obligatoires :
+#   oracle_home      : ex. /u01/app/oracle/product/19c/dbhome_1
+#   oracle_base      : ex. /u01/app/oracle
+#   oracle_sid       : ex. ORCL
+#   patch_stage_dir  : répertoire contenant les zips extraits  ex. /tmp/patches
+#   ru_patch_id      : numéro du patch RU                      ex. 35742441
+#   opatch_zip       : chemin vers le zip OPatch               ex. /tmp/p6880880_190000_Linux-x86-64.zip
+#   apply_ojvm       : true | false  (défaut: false)
+#   ojvm_patch_id    : numéro patch OJVM (si apply_ojvm=true)  ex. 35742413
+#
+# Installation de la collection :
+#   ansible-galaxy collection install opitzconsulting.ansible_oracle
+#
+# Exemple d'appel :
+#   ansible-playbook oracle19c_patch_collection.yml \
+#     -e "oracle_home=/u01/app/oracle/product/19c/dbhome_1" \
+#     -e "oracle_base=/u01/app/oracle" \
+#     -e "oracle_sid=ORCL" \
+#     -e "patch_stage_dir=/tmp/patches" \
+#     -e "ru_patch_id=35742441" \
+#     -e "opatch_zip=/tmp/p6880880_190000_Linux-x86-64.zip" \
+#     -e "apply_ojvm=true" \
+#     -e "ojvm_patch_id=35742413"
+###############################################################################
+
+- name: "Oracle 19c — Patching Single Instance (approche collection)"
+  hosts: oracle_servers
+  gather_facts: true
+  become: true
+  become_user: oracle
+
+  vars:
+    apply_ojvm: false
+    oracle_user: oracle
+    oracle_group: oinstall
+    ru_patch_dir: "{{ patch_stage_dir }}/{{ ru_patch_id }}"
+    ojvm_patch_dir: "{{ patch_stage_dir }}/{{ ojvm_patch_id | default('') }}"
+
+  tasks:
+
+    # =========================================================================
+    # PHASE 0 — PRÉ-VÉRIFICATIONS
+    # =========================================================================
+    - name: "0.1 | Vérifier l'espace disque (>= 15 Go)"
+      ansible.builtin.shell: |
+        df -BG "{{ oracle_home }}" | awk 'NR==2 {gsub("G","",$4); print $4}'
+      register: free_space_gb
+      changed_when: false
+
+    - name: "0.1 | Échouer si espace insuffisant"
+      ansible.builtin.fail:
+        msg: "❌ Espace insuffisant : {{ free_space_gb.stdout | int }} Go (min 15 Go requis)"
+      when: free_space_gb.stdout | int < 15
+
+    # =========================================================================
+    # PHASE 1 — UPGRADE OPATCH via la collection
+    # =========================================================================
+    - name: "1.1 | Mettre à jour OPatch avec la collection"
+      opitzconsulting.ansible_oracle.oracle_opatch:
+        oracle_home: "{{ oracle_home }}"
+        patch_base: "{{ opatch_zip }}"
+        state: present
+        opatch_auto: false
+      register: opatch_result
+
+    - name: "1.1 | Résultat upgrade OPatch"
+      ansible.builtin.debug:
+        var: opatch_result
+
+    # =========================================================================
+    # PHASE 2 — ARRÊT VIA sqlplus (la collection gère le patching binaire)
+    # =========================================================================
+    - name: "2.1 | Arrêter le listener"
+      ansible.builtin.shell: lsnrctl stop
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      failed_when: false
+      changed_when: true
+
+    - name: "2.2 | Arrêter la base Oracle"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        shutdown immediate;
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: db_shutdown
+      changed_when: true
+
+    - name: "2.3 | Pause 30s — attente arrêt complet"
+      ansible.builtin.pause:
+        seconds: 30
+
+    # =========================================================================
+    # PHASE 3 — APPLICATION PATCH RU via le module oracle_opatch
+    # =========================================================================
+    - name: "3.1 | Appliquer le patch RU {{ ru_patch_id }} via oracle_opatch"
+      opitzconsulting.ansible_oracle.oracle_opatch:
+        oracle_home: "{{ oracle_home }}"
+        patch_base: "{{ ru_patch_dir }}"
+        patch_id: "{{ ru_patch_id }}"
+        state: present
+        opatch_auto: false
+        offline: true
+        stop_processes: false        # déjà arrêté manuellement ci-dessus
+      register: ru_result
+
+    - name: "3.1 | Résultat patch RU"
+      ansible.builtin.debug:
+        var: ru_result
+
+    - name: "3.2 | Appliquer le patch OJVM {{ ojvm_patch_id }} (si demandé)"
+      opitzconsulting.ansible_oracle.oracle_opatch:
+        oracle_home: "{{ oracle_home }}"
+        patch_base: "{{ ojvm_patch_dir }}"
+        patch_id: "{{ ojvm_patch_id }}"
+        state: present
+        opatch_auto: false
+        offline: true
+        stop_processes: false
+      register: ojvm_result
+      when: apply_ojvm | bool
+
+    - name: "3.2 | Résultat patch OJVM"
+      ansible.builtin.debug:
+        var: ojvm_result
+      when: apply_ojvm | bool
+
+    # =========================================================================
+    # PHASE 4 — REDÉMARRAGE
+    # =========================================================================
+    - name: "4.1 | Démarrer la base Oracle"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        startup;
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: db_startup
+      changed_when: true
+
+    - name: "4.2 | Attendre que la base soit OPEN (retries 10 x 30s)"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        set heading off feedback off
+        select status from v\$instance;
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: db_open_check
+      until: "'OPEN' in db_open_check.stdout"
+      retries: 10
+      delay: 30
+      changed_when: false
+
+    - name: "4.3 | Démarrer le listener"
+      ansible.builtin.shell: lsnrctl start
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      changed_when: true
+
+    # =========================================================================
+    # PHASE 5 — POST-ACTIONS (datapatch + utlrp)
+    # =========================================================================
+    - name: "5.1 | Exécuter datapatch"
+      ansible.builtin.shell: |
+        "{{ oracle_home }}/OPatch/datapatch" -verbose
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: datapatch_out
+      changed_when: "'Datapatch execution finished' in datapatch_out.stdout"
+
+    - name: "5.2 | Recompiler les objets invalides (utlrp)"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        @?/rdbms/admin/utlrp.sql
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      changed_when: false
+
+    # =========================================================================
+    # PHASE 6 — VALIDATION FINALE
+    # =========================================================================
+    - name: "6.1 | Vérifier la version Oracle"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        set heading off feedback off
+        select instance_name, status, version_full from v\$instance;
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: final_version
+      changed_when: false
+
+    - name: "6.2 | Objets invalides restants"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        set heading off feedback off
+        select count(*) from dba_objects where status='INVALID';
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: invalid_count
+      changed_when: false
+
+    - name: "6.3 | Statut patches dans dba_registry_sqlpatch"
+      ansible.builtin.shell: |
+        sqlplus -s / as sysdba <<EOF
+        set heading off feedback off linesize 200
+        select patch_id, action, status, description
+        from   dba_registry_sqlpatch
+        order  by action_time desc
+        fetch first 5 rows only;
+        exit;
+        EOF
+      environment:
+        ORACLE_HOME: "{{ oracle_home }}"
+        ORACLE_SID: "{{ oracle_sid }}"
+        PATH: "{{ oracle_home }}/bin:/usr/local/bin:/bin:/usr/bin"
+      register: sqlpatch_status
+      changed_when: false
+
+    - name: "6.4 | ✅ RAPPORT FINAL"
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - "  RAPPORT DE PATCHING — collection oracle_opatch"
+          - "================================================"
+          - "Instance         : {{ final_version.stdout | trim }}"
+          - "Patch RU         : {{ ru_patch_id }} — {{ ru_result.msg | default('OK') }}"
+          - "Patch OJVM       : {{ ojvm_patch_id | default('non appliqué') }}"
+          - "Objets invalides : {{ invalid_count.stdout | trim }}"
+          - "dba_registry_sqlpatch :"
+          - "{{ sqlpatch_status.stdout_lines }}"
+          - "================================================"
