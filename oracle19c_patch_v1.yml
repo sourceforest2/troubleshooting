@@ -1,0 +1,693 @@
+---
+# ============================================================
+# Playbook : Patch Oracle Database sur Linux
+# avec configuration NFS partagée pour les patches
+#
+# Usage :
+#   # Configurer le serveur NFS + monter sur les clients + patcher :
+#   ansible-playbook oracle_patch.yml \
+#     -e "patch_id=35742441 patch_zip=/depot/p35742441_190000_Linux-x86-64.zip"
+#
+#   # Skiper la config NFS (NFS déjà en place) :
+#   ansible-playbook oracle_patch.yml \
+#     -e "patch_id=35742441 patch_zip=/depot/p35742441_190000_Linux-x86-64.zip" \
+#     --skip-tags nfs_server,nfs_client
+#
+#   # Configurer uniquement le NFS sans patcher :
+#   ansible-playbook oracle_patch.yml \
+#     -e "patch_id=dummy patch_zip=dummy" \
+#     --tags nfs_server,nfs_client
+# ============================================================
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  PLAY 1 — Configuration du serveur NFS                  ║
+# ╚══════════════════════════════════════════════════════════╝
+- name: Configurer le serveur NFS pour le dépôt de patches
+  hosts: nfs_server
+  become: true
+  gather_facts: true
+
+  vars:
+    nfs_export_dir: /exports/oracle_patches   # Répertoire exporté
+    nfs_allowed_network: "192.168.10.0/24"    # Réseau des clients Oracle
+    nfs_export_options: "ro,sync,no_root_squash,no_subtree_check"
+    nfs_packages_rhel: [nfs-utils, rpcbind]
+    nfs_packages_debian: [nfs-kernel-server, nfs-common]
+    nfs_uid_oracle: 54321                     # UID de l'user oracle sur les clients
+    nfs_gid_oinstall: 54321                   # GID du groupe oinstall
+
+  tasks:
+
+    # ── Installation NFS ──────────────────────────────────
+    - name: "NFS SERVER | Installer les packages NFS (RHEL/OEL)"
+      yum:
+        name: "{{ nfs_packages_rhel }}"
+        state: present
+      when: ansible_os_family == "RedHat"
+      tags: [nfs_server]
+
+    - name: "NFS SERVER | Installer les packages NFS (Debian/Ubuntu)"
+      apt:
+        name: "{{ nfs_packages_debian }}"
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+      tags: [nfs_server]
+
+    # ── Structure des répertoires ─────────────────────────
+    - name: "NFS SERVER | Créer le répertoire racine d'export"
+      file:
+        path: "{{ nfs_export_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: [nfs_server]
+
+    - name: "NFS SERVER | Créer les sous-répertoires de dépôt"
+      file:
+        path: "{{ nfs_export_dir }}/{{ item }}"
+        state: directory
+        owner: "{{ nfs_uid_oracle }}"
+        group: "{{ nfs_gid_oinstall }}"
+        mode: '0755'
+      loop:
+        - patches       # Fichiers ZIP des patches Oracle
+        - opatch        # Binaires OPatch mis à jour
+        - scripts       # Scripts SQL/shell annexes
+        - logs          # Logs centralisés post-patch
+      tags: [nfs_server]
+
+    # ── Configuration exports NFS ─────────────────────────
+    - name: "NFS SERVER | Configurer /etc/exports"
+      blockinfile:
+        path: /etc/exports
+        marker: "# {mark} ANSIBLE MANAGED — Oracle Patches NFS"
+        block: |
+          {{ nfs_export_dir }}  {{ nfs_allowed_network }}({{ nfs_export_options }})
+        create: true
+        backup: true
+      notify:
+        - Reload NFS exports
+      tags: [nfs_server]
+
+    # ── Firewall ──────────────────────────────────────────
+    - name: "NFS SERVER | Ouvrir les ports NFS dans firewalld (RHEL)"
+      firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - nfs
+        - rpc-bind
+        - mountd
+      when: ansible_os_family == "RedHat"
+      ignore_errors: true
+      tags: [nfs_server, firewall]
+
+    - name: "NFS SERVER | Ouvrir les ports NFS dans ufw (Debian)"
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "2049"
+        - "111"
+      when: ansible_os_family == "Debian"
+      ignore_errors: true
+      tags: [nfs_server, firewall]
+
+    # ── Services NFS ──────────────────────────────────────
+    - name: "NFS SERVER | Activer et démarrer rpcbind"
+      systemd:
+        name: rpcbind
+        enabled: true
+        state: started
+      tags: [nfs_server]
+
+    - name: "NFS SERVER | Activer et démarrer nfs-server (RHEL)"
+      systemd:
+        name: nfs-server
+        enabled: true
+        state: started
+      when: ansible_os_family == "RedHat"
+      tags: [nfs_server]
+
+    - name: "NFS SERVER | Activer et démarrer nfs-kernel-server (Debian)"
+      systemd:
+        name: nfs-kernel-server
+        enabled: true
+        state: started
+      when: ansible_os_family == "Debian"
+      tags: [nfs_server]
+
+    # ── Vérification ──────────────────────────────────────
+    - name: "NFS SERVER | Vérifier les exports actifs"
+      command: exportfs -v
+      register: exportfs_result
+      changed_when: false
+      tags: [nfs_server]
+
+    - name: "NFS SERVER | Afficher les exports"
+      debug:
+        var: exportfs_result.stdout_lines
+      tags: [nfs_server]
+
+    # ── Copie du ZIP patch sur le serveur NFS ─────────────
+    - name: "NFS SERVER | Déposer le ZIP du patch dans le dépôt NFS"
+      copy:
+        src: "{{ patch_zip }}"
+        dest: "{{ nfs_export_dir }}/patches/{{ patch_zip | basename }}"
+        owner: "{{ nfs_uid_oracle }}"
+        group: "{{ nfs_gid_oinstall }}"
+        mode: '0644'
+      when:
+        - patch_zip is defined
+        - patch_zip != ""
+        - patch_zip != "dummy"
+      tags: [nfs_server, deploy_patch_to_nfs]
+
+  handlers:
+    - name: Reload NFS exports
+      command: exportfs -ra
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  PLAY 2 — Montage NFS sur les serveurs Oracle (clients) ║
+# ╚══════════════════════════════════════════════════════════╝
+- name: Configurer le montage NFS sur les serveurs Oracle
+  hosts: oracle_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    nfs_server_ip: "{{ hostvars[groups['nfs_server'][0]]['ansible_default_ipv4']['address'] }}"
+    nfs_export_dir: /exports/oracle_patches
+    nfs_mount_point: /mnt/oracle_patches
+    nfs_mount_options: "ro,hard,intr,timeo=30,retrans=3,nfsvers=4,_netdev"
+    nfs_packages_rhel: [nfs-utils]
+    nfs_packages_debian: [nfs-common]
+
+  tasks:
+
+    # ── Installation client NFS ───────────────────────────
+    - name: "NFS CLIENT | Installer nfs-utils (RHEL/OEL)"
+      yum:
+        name: "{{ nfs_packages_rhel }}"
+        state: present
+      when: ansible_os_family == "RedHat"
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Installer nfs-common (Debian/Ubuntu)"
+      apt:
+        name: "{{ nfs_packages_debian }}"
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+      tags: [nfs_client]
+
+    # ── Point de montage ──────────────────────────────────
+    - name: "NFS CLIENT | Créer le point de montage"
+      file:
+        path: "{{ nfs_mount_point }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: [nfs_client]
+
+    # ── Test de connectivité NFS ──────────────────────────
+    - name: "NFS CLIENT | Tester la connectivité vers le serveur NFS (port 2049)"
+      wait_for:
+        host: "{{ nfs_server_ip }}"
+        port: 2049
+        timeout: 15
+        msg: "Le serveur NFS {{ nfs_server_ip }} n'est pas joignable sur le port 2049"
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Lister les exports disponibles sur le serveur NFS"
+      command: "showmount -e {{ nfs_server_ip }}"
+      register: showmount_result
+      changed_when: false
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Afficher les exports NFS disponibles"
+      debug:
+        var: showmount_result.stdout_lines
+      tags: [nfs_client]
+
+    # ── Montage NFS ───────────────────────────────────────
+    - name: "NFS CLIENT | Monter le partage NFS (+ persistance fstab)"
+      mount:
+        path: "{{ nfs_mount_point }}"
+        src: "{{ nfs_server_ip }}:{{ nfs_export_dir }}"
+        fstype: nfs
+        opts: "{{ nfs_mount_options }}"
+        state: mounted        # Monte ET ajoute dans /etc/fstab
+      tags: [nfs_client]
+
+    # ── Vérification du montage ───────────────────────────
+    - name: "NFS CLIENT | Vérifier que le montage est actif"
+      command: "mountpoint -q {{ nfs_mount_point }}"
+      register: mountpoint_check
+      changed_when: false
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Lister les patches disponibles sur NFS"
+      find:
+        paths: "{{ nfs_mount_point }}/patches"
+        patterns: "*.zip"
+      register: nfs_patches_list
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Afficher les patches disponibles"
+      debug:
+        msg: "Patches disponibles : {{ nfs_patches_list.files | map(attribute='path') | list }}"
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | Confirmer la persistance fstab"
+      command: "grep {{ nfs_mount_point }} /etc/fstab"
+      register: fstab_check
+      changed_when: false
+      failed_when: false
+      tags: [nfs_client]
+
+    - name: "NFS CLIENT | ✅ Montage NFS persistant confirmé"
+      debug:
+        msg: "{{ fstab_check.stdout }}"
+      when: fstab_check.rc == 0
+      tags: [nfs_client]
+
+
+# ╔══════════════════════════════════════════════════════════╗
+# ║  PLAY 3 — Patch Oracle Database                         ║
+# ╚══════════════════════════════════════════════════════════╝
+- name: Patch Oracle Database
+  hosts: oracle_servers
+  become: true
+  gather_facts: true
+  serial: 1   # Un serveur à la fois (rolling patch)
+
+  vars:
+    oracle_user: oracle
+    oracle_group: oinstall
+    oracle_base: /u01/app/oracle
+    oracle_home: /u01/app/oracle/product/19.3.0/dbhome_1
+    oraInventory: /u01/app/oraInventory
+    patch_base_dir: /u01/patches
+    nfs_mount_point: /mnt/oracle_patches     # Monté par le Play 2
+    opatch_min_version: "12.2.0.1.36"
+    db_services: []
+    apply_datapatch: true
+    backup_enabled: true
+    rollback_on_failure: true
+    patch_id: ""              # OBLIGATOIRE: passer via -e
+    patch_zip: ""             # OBLIGATOIRE: passer via -e
+    # Source du patch : "nfs" (depuis le partage) ou "local" (copie SSH)
+    patch_source: "nfs"
+
+  pre_tasks:
+
+    - name: Vérifier que patch_id et patch_zip sont fournis
+      assert:
+        that:
+          - patch_id != ""
+          - patch_zip != ""
+        fail_msg: "Vous devez fournir patch_id et patch_zip en extra-vars (-e)"
+
+    - name: Vérifier que le fichier ZIP existe sur le partage NFS
+      stat:
+        path: "{{ nfs_mount_point }}/patches/{{ patch_zip | basename }}"
+      register: nfs_zip_stat
+      when: patch_source == "nfs"
+
+    - name: Échec si le ZIP est introuvable sur NFS
+      fail:
+        msg: >
+          Le patch '{{ patch_zip | basename }}' est introuvable dans
+          {{ nfs_mount_point }}/patches/. Vérifiez que le Play 1 a bien déposé le fichier.
+      when:
+        - patch_source == "nfs"
+        - not nfs_zip_stat.stat.exists
+
+    - name: Vérifier le fichier ZIP en local (mode local)
+      stat:
+        path: "{{ patch_zip }}"
+      register: local_zip_stat
+      delegate_to: localhost
+      become: false
+      when: patch_source == "local"
+
+    - name: Échec si le ZIP local est introuvable
+      fail:
+        msg: "Le fichier patch '{{ patch_zip }}' est introuvable sur le contrôleur Ansible."
+      when:
+        - patch_source == "local"
+        - not local_zip_stat.stat.exists
+
+  tasks:
+
+    # ── 1. Pré-checks ────────────────────────────────────────
+    - name: "BLOCK — Pré-vérifications"
+      block:
+
+        - name: Vérifier l'espace disque sur ORACLE_HOME (min 5 Go)
+          shell: df -BG {{ oracle_home }} | awk 'NR==2{print $4}' | tr -d 'G'
+          register: disk_free
+          changed_when: false
+
+        - name: Échec si espace insuffisant
+          fail:
+            msg: "Espace disque insuffisant : {{ disk_free.stdout }} Go disponibles (5 Go requis)."
+          when: disk_free.stdout | int < 5
+
+        - name: Récupérer la version OPatch courante
+          shell: "{{ oracle_home }}/OPatch/opatch version | awk '/OPatch Version/{print $NF}'"
+          become_user: "{{ oracle_user }}"
+          register: opatch_version
+          changed_when: false
+
+        - name: Afficher la version OPatch
+          debug:
+            msg: "OPatch version : {{ opatch_version.stdout }}"
+
+        - name: Lister les patches déjà appliqués
+          shell: "{{ oracle_home }}/OPatch/opatch lspatches 2>/dev/null"
+          become_user: "{{ oracle_user }}"
+          register: patches_installed
+          changed_when: false
+
+        - name: Vérifier si le patch est déjà installé
+          fail:
+            msg: "Le patch {{ patch_id }} est déjà appliqué sur cet hôte."
+          when: patch_id in patches_installed.stdout
+
+        - name: Détecter les instances Oracle en cours d'exécution
+          shell: "ps -ef | grep ora_pmon | grep -v grep | awk '{print $NF}' | sed 's/ora_pmon_//'"
+          register: running_instances
+          changed_when: false
+
+        - name: Afficher les instances détectées
+          debug:
+            msg: "Instances Oracle actives : {{ running_instances.stdout_lines }}"
+
+      tags: [precheck]
+
+    # ── 2. Sauvegarde de l'ORACLE_HOME ───────────────────────
+    - name: "BLOCK — Sauvegarde ORACLE_HOME"
+      block:
+
+        - name: Créer le répertoire de backup local
+          file:
+            path: "{{ patch_base_dir }}/backup"
+            state: directory
+            owner: "{{ oracle_user }}"
+            group: "{{ oracle_group }}"
+            mode: '0755'
+
+        - name: Sauvegarder l'inventaire opatch (avant patch)
+          shell: >
+            {{ oracle_home }}/OPatch/opatch lspatches >
+            {{ patch_base_dir }}/backup/opatch_lspatches_before_{{ patch_id }}.txt
+          become_user: "{{ oracle_user }}"
+          changed_when: false
+
+        - name: Tar ORACLE_HOME (hors admin/diag)
+          archive:
+            path: "{{ oracle_home }}"
+            dest: "{{ patch_base_dir }}/backup/oracle_home_before_{{ patch_id }}.tar.gz"
+            format: gz
+            exclude_path:
+              - "{{ oracle_home }}/admin"
+              - "{{ oracle_home }}/diag"
+          become_user: "{{ oracle_user }}"
+
+        - name: Copier le rapport avant-patch vers NFS/logs
+          copy:
+            src: "{{ patch_base_dir }}/backup/opatch_lspatches_before_{{ patch_id }}.txt"
+            dest: "{{ nfs_mount_point }}/logs/{{ inventory_hostname }}_before_{{ patch_id }}.txt"
+            remote_src: true
+          ignore_errors: true
+
+      when: backup_enabled
+      tags: [backup]
+
+    # ── 3. Déploiement du patch ───────────────────────────────
+    - name: "BLOCK — Déploiement du patch"
+      block:
+
+        - name: Créer le répertoire de staging local
+          file:
+            path: "{{ patch_base_dir }}/{{ patch_id }}"
+            state: directory
+            owner: "{{ oracle_user }}"
+            group: "{{ oracle_group }}"
+            mode: '0755'
+
+        - name: Copier le ZIP depuis le partage NFS (mode nfs)
+          copy:
+            src: "{{ nfs_mount_point }}/patches/{{ patch_zip | basename }}"
+            dest: "{{ patch_base_dir }}/{{ patch_id }}/{{ patch_zip | basename }}"
+            owner: "{{ oracle_user }}"
+            group: "{{ oracle_group }}"
+            mode: '0644'
+            remote_src: true
+          when: patch_source == "nfs"
+
+        - name: Copier le ZIP depuis le contrôleur Ansible (mode local)
+          copy:
+            src: "{{ patch_zip }}"
+            dest: "{{ patch_base_dir }}/{{ patch_id }}/{{ patch_zip | basename }}"
+            owner: "{{ oracle_user }}"
+            group: "{{ oracle_group }}"
+            mode: '0644'
+          when: patch_source == "local"
+
+        - name: Extraire le patch
+          unarchive:
+            src: "{{ patch_base_dir }}/{{ patch_id }}/{{ patch_zip | basename }}"
+            dest: "{{ patch_base_dir }}/{{ patch_id }}/"
+            remote_src: true
+            owner: "{{ oracle_user }}"
+            group: "{{ oracle_group }}"
+
+      tags: [deploy]
+
+    # ── 4. Arrêt des services Oracle ─────────────────────────
+    - name: "BLOCK — Arrêt des instances et listeners"
+      block:
+
+        - name: Arrêter le listener Oracle
+          shell: |
+            source /etc/oraenv <<< {{ item }}
+            lsnrctl stop
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          ignore_errors: true
+
+        - name: Arrêter chaque instance Oracle
+          shell: |
+            export ORACLE_SID={{ item }}
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            sqlplus -s / as sysdba <<EOF
+            SHUTDOWN IMMEDIATE;
+            EXIT;
+            EOF
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          register: shutdown_result
+
+        - name: Attendre l'arrêt complet des processus Oracle
+          wait_for:
+            path: "/tmp/.oracle/npoacle{{ item }}"
+            state: absent
+            timeout: 120
+          with_items: "{{ running_instances.stdout_lines }}"
+          ignore_errors: true
+
+      tags: [stop_db]
+
+    # ── 5. Application du patch OPatch ───────────────────────
+    - name: "BLOCK — Application du patch"
+      block:
+
+        - name: Valider le conflit de patch (opatch prereq)
+          shell: >
+            {{ oracle_home }}/OPatch/opatch prereq CheckConflictAgainstOHWithDetail
+            -ph {{ patch_base_dir }}/{{ patch_id }}/{{ patch_id }}
+          become_user: "{{ oracle_user }}"
+          register: prereq_result
+          changed_when: false
+
+        - name: Afficher le résultat prereq
+          debug:
+            var: prereq_result.stdout_lines
+
+        - name: Appliquer le patch avec OPatch
+          shell: >
+            {{ oracle_home }}/OPatch/opatch apply
+            {{ patch_base_dir }}/{{ patch_id }}/{{ patch_id }}
+            -silent -oh {{ oracle_home }}
+          become_user: "{{ oracle_user }}"
+          register: opatch_apply
+          environment:
+            ORACLE_HOME: "{{ oracle_home }}"
+
+        - name: Afficher le résultat de l'application
+          debug:
+            var: opatch_apply.stdout_lines
+
+      rescue:
+        - name: "[ROLLBACK] Annuler le patch en cas d'échec"
+          shell: >
+            {{ oracle_home }}/OPatch/opatch rollback
+            -id {{ patch_id }}
+            -silent -oh {{ oracle_home }}
+          become_user: "{{ oracle_user }}"
+          when: rollback_on_failure
+          ignore_errors: true
+
+        - name: Fail explicite après rollback
+          fail:
+            msg: "L'application du patch {{ patch_id }} a échoué. Rollback effectué si activé."
+
+      tags: [apply_patch]
+
+    # ── 6. Redémarrage des services ───────────────────────────
+    - name: "BLOCK — Redémarrage Oracle"
+      block:
+
+        - name: Démarrer chaque instance Oracle
+          shell: |
+            export ORACLE_SID={{ item }}
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            sqlplus -s / as sysdba <<EOF
+            STARTUP;
+            EXIT;
+            EOF
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          register: startup_result
+
+        - name: Démarrer le listener Oracle
+          shell: |
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            lsnrctl start
+          become_user: "{{ oracle_user }}"
+          ignore_errors: true
+
+        - name: Attendre que l'instance soit ouverte (max 5 min)
+          shell: |
+            export ORACLE_SID={{ item }}
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            sqlplus -s / as sysdba <<EOF
+            SET HEADING OFF FEEDBACK OFF
+            SELECT STATUS FROM V\$INSTANCE;
+            EXIT;
+            EOF
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          register: instance_status
+          until: "'OPEN' in instance_status.stdout"
+          retries: 30
+          delay: 10
+
+      tags: [start_db]
+
+    # ── 7. Datapatch (patches SQL) ────────────────────────────
+    - name: "BLOCK — Exécution de datapatch"
+      block:
+
+        - name: Lancer datapatch -verbose
+          shell: |
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            export ORACLE_SID={{ item }}
+            {{ oracle_home }}/OPatch/datapatch -verbose
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          register: datapatch_result
+          timeout: 3600
+
+        - name: Afficher la sortie datapatch
+          debug:
+            var: datapatch_result.results | map(attribute='stdout_lines') | list
+
+      when: apply_datapatch
+      tags: [datapatch]
+
+    # ── 8. Post-checks ────────────────────────────────────────
+    - name: "BLOCK — Post-vérifications"
+      block:
+
+        - name: Vérifier la présence du patch dans opatch lspatches
+          shell: "{{ oracle_home }}/OPatch/opatch lspatches | grep {{ patch_id }}"
+          become_user: "{{ oracle_user }}"
+          register: patch_verify
+          changed_when: false
+
+        - name: "✅ Confirmer que le patch est bien appliqué"
+          debug:
+            msg: "Patch {{ patch_id }} confirmé : {{ patch_verify.stdout }}"
+
+        - name: Vérifier l'état de la base de données post-patch
+          shell: |
+            export ORACLE_SID={{ item }}
+            export ORACLE_HOME={{ oracle_home }}
+            export PATH=$ORACLE_HOME/bin:$PATH
+            sqlplus -s / as sysdba <<EOF
+            SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+            SELECT 'DB:'||NAME||' STATUS:'||OPEN_MODE FROM V\$DATABASE;
+            SELECT 'COMP:'||COMP_NAME||' STATUS:'||STATUS FROM DBA_REGISTRY ORDER BY 1;
+            EXIT;
+            EOF
+          with_items: "{{ running_instances.stdout_lines }}"
+          become_user: "{{ oracle_user }}"
+          register: db_status
+          changed_when: false
+
+        - name: Afficher l'état des composants Oracle
+          debug:
+            var: db_status.results | map(attribute='stdout_lines') | list
+
+        - name: Sauvegarder le rapport post-patch localement
+          shell: >
+            {{ oracle_home }}/OPatch/opatch lspatches >
+            {{ patch_base_dir }}/backup/opatch_lspatches_after_{{ patch_id }}.txt
+          become_user: "{{ oracle_user }}"
+          changed_when: false
+
+        - name: Copier le rapport post-patch vers NFS/logs
+          copy:
+            src: "{{ patch_base_dir }}/backup/opatch_lspatches_after_{{ patch_id }}.txt"
+            dest: "{{ nfs_mount_point }}/logs/{{ inventory_hostname }}_after_{{ patch_id }}.txt"
+            remote_src: true
+          ignore_errors: true
+
+      tags: [postcheck]
+
+    # ── 9. Nettoyage ──────────────────────────────────────────
+    - name: Supprimer les fichiers de staging locaux
+      file:
+        path: "{{ patch_base_dir }}/{{ patch_id }}"
+        state: absent
+      tags: [cleanup]
+
+  post_tasks:
+
+    - name: Résumé final
+      debug:
+        msg:
+          - "══════════════════════════════════════════════"
+          - "  Patch Oracle {{ patch_id }} terminé"
+          - "  Hôte     : {{ inventory_hostname }}"
+          - "  Date     : {{ ansible_date_time.iso8601 }}"
+          - "  Source   : {{ patch_source | upper }}"
+          - "  Backup   : {{ patch_base_dir }}/backup/"
+          - "  NFS logs : {{ nfs_mount_point }}/logs/"
+          - "══════════════════════════════════════════════"
