@@ -1,0 +1,45 @@
+
+
+
+
+
+.stdout, .rc, .stderr, .stdout_lines
+
+# ======================================================
+# AND explicite — une seule ligne
+when: ansible_os_family == "RedHat" and patch_enabled
+
+# AND implicite — liste YAML (plus lisible)
+when:
+  - ansible_os_family == "RedHat"
+  - patch_enabled
+  - disk_free.stdout | int >= 5
+
+# OR
+when: ansible_distribution == "OracleLinux" or ansible_distribution == "RHEL"
+
+
+# ======================================================
+Facts utiles : ansible_os_family, ansible_distribution, ansible_distribution_major_version, ansible_hostname, ansible_default_ipv4.address
+
+
+# ======================================================
+- name: Vérifier si OPatch existe
+  stat:
+    path: /u01/app/oracle/product/19.3.0/dbhome_1/OPatch/opatch
+  register: opatch_bin
+
+- name: Échouer si OPatch est absent
+  fail:
+    msg: "OPatch introuvable, vérifiez ORACLE_HOME"
+  when: not opatch_bin.stat.exists
+
+
+# ======================================================
+  - name: Arrêter uniquement les instances actives
+  shell: |
+    export ORACLE_SID={{ item }}
+    sqlplus / as sysdba <<EOF
+    SHUTDOWN IMMEDIATE; EXIT; EOF
+  loop: "{{ all_instances }}"
+  when: "item in running_instances.stdout"
